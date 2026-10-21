@@ -60,10 +60,6 @@ python Downloadminercaft.py
 
 本项目采用 **MIT License**，完整条款见仓库根目录的 [`LICENSE`](LICENSE)。
 
-MIT 是 OSI 认可的宽松开源协议：允许使用、复制、修改、合并、发布、分发、再许可和销售，唯一要求是保留版权声明与许可文本。GitHub 会自动识别为 MIT。
-
-> MIT 允许商业使用。如果以后想限制商用，需要改用非商业许可（如 PolyForm Noncommercial），但那样就不再是 OSI 定义的开源协议了。
-
 ## 许可与免责
 
 本工具仅提供 Minecraft 相关文件的下载便利，**不包含任何游戏资源本体**，所有文件均来自 Mojang 官方、BMCLAPI 镜像、各加载器官方 Maven 及第三方服务端官方 API。使用前请确保你已拥有正版 Minecraft。
