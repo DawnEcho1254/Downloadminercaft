@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Required Notice: Copyright (c) 2025 Downloadminercaft
+# Required Notice: Copyright (c) 2026 DawnEcho1254
 # Licensed under the MIT License (see LICENSE).
 """
-Minecraft 下载器（客户端 / 服务端 / 加载器 / 整合包 四模式）
+Minecraft 下载器
 依赖：pip install ttkbootstrap
 仓库：https://github.com/DawnEcho1254/Downloadminercaft
 """
@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -59,6 +60,10 @@ FABRIC_PROFILE_URLS = (
     "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/{mc}/{loader}/profile/json",
 )
 QUILT_PROFILE_URL = "https://meta.quiltmc.org/v3/versions/loader/{mc}/{loader}/profile/json"
+FABRIC_LOADER_LIST_URLS = (
+    "https://meta.fabricmc.net/v2/versions/loader/{mc}",
+    "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/{mc}",
+)
 
 FORGE_PROMOS_URL = "https://files.minecraftforge.net/maven/net/minecraftforge/forge/promotions_slim.json"
 FORGE_OFFICIAL_ROOT = "https://maven.minecraftforge.net/net/minecraftforge/forge"
@@ -166,7 +171,7 @@ def host_reachable(url, timeout=4):
 
 
 def log_exception(context=""):
-    """把异常写到 %LOCALAPPDATA%\\mc-downloader-error.log，没有 stderr 时也不会二次报错。"""
+    """把异常写到 %LOCALAPPDATA%\\mc-downloader-error.log，无 stderr 时也不会二次报错。"""
     try:
         text = "".join(traceback.format_exception(*sys.exc_info()))
     except Exception:
@@ -728,38 +733,91 @@ def _merge_version_json(base, overlay):
     return merged
 
 
+def fetch_loader_overlay(mc, loader_name, loader_version):
+    """获取加载器版本 profile（只含加载器部分），供合并进已有版本 JSON。"""
+    loader = (loader_name or "").lower()
+    version = loader_version or ""
+    if not mc or not loader or not version:
+        raise RuntimeError("缺少 Minecraft 版本或加载器版本")
+    if loader == "fabric":
+        return _json_from_urls([
+            url.format(mc=mc, loader=version) for url in FABRIC_PROFILE_URLS
+        ])
+    if loader == "quilt":
+        return _json_from_urls([
+            QUILT_PROFILE_URL.format(mc=mc, loader=version)
+        ])
+    if loader == "forge":
+        vid = version if version.startswith(mc + "-") else f"{mc}-{version}"
+        return _version_json_from_installer([
+            f"{FORGE_OFFICIAL_ROOT}/{vid}/forge-{vid}-installer.jar",
+            f"{FORGE_MIRROR_ROOT}/{vid}/forge-{vid}-installer.jar",
+        ])
+    if loader == "neoforge":
+        vid = version
+        return _version_json_from_installer([
+            f"{NEOFORGE_MIRROR_ROOT}/{vid}/neoforge-{vid}-installer.jar",
+            f"{NEOFORGE_OFFICIAL_ROOT}/{vid}/neoforge-{vid}-installer.jar",
+        ])
+    raise RuntimeError(f"不支持的加载器：{loader_name}")
+
+
+def fetch_loader_versions(mc, loader_name):
+    """列出某个 Minecraft 版本可用的加载器版本（新到旧）。"""
+    loader = (loader_name or "").lower()
+    if loader == "fabric":
+        for url in FABRIC_LOADER_LIST_URLS:
+            try:
+                data = json.loads(
+                    _fetch_bytes(url.format(mc=mc)).decode("utf-8", "ignore")
+                )
+            except Exception:
+                continue
+            versions = []
+            for item in data if isinstance(data, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                inner = item.get("loader")
+                version = (inner or {}).get("version") if isinstance(inner, dict) else item.get("version")
+                if version:
+                    versions.append(str(version))
+            if versions:
+                return sorted(set(versions), key=version_key, reverse=True)
+        raise RuntimeError("无法获取 Fabric 加载器版本")
+    if loader == "forge":
+        prefixes = (mc + "-",)
+        versions = []
+        for full in fetch_forge_all_versions():
+            for prefix in prefixes:
+                if full.startswith(prefix):
+                    versions.append(full[len(prefix):])
+                    break
+        if not versions:
+            raise RuntimeError(f"Forge 没有适用于 {mc} 的版本")
+        return sorted(set(versions), key=version_key, reverse=True)
+    if loader == "neoforge":
+        versions = [
+            v for v in fetch_neoforge_all_versions()
+            if neoforge_mc_version(v, {mc}) == mc
+        ]
+        if not versions:
+            raise RuntimeError(f"NeoForge 没有适用于 {mc} 的版本")
+        return sorted(set(versions), key=version_key, reverse=True)
+    raise RuntimeError(f"不支持的加载器：{loader_name}")
+
+
 def build_modpack_version_json(pack):
     """给整合包生成一份完整的、自包含的版本 JSON：加载器的 mainClass / libraries /
     arguments 直接合并进原版清单，不再用 inheritsFrom 挂成子版本。"""
     mc = str(pack.get("mc") or "")
     if not mc:
         raise RuntimeError("整合包没有声明 Minecraft 版本，无法生成版本 JSON")
+    base = _vanilla_version_json(mc)
     loader = str(pack.get("loader_name") or "").lower()
     loader_ver = str(pack.get("loader_version") or "")
-    base = _vanilla_version_json(mc)
-
-    if loader == "fabric" and loader_ver:
-        overlay = _json_from_urls([
-            url.format(mc=mc, loader=loader_ver) for url in FABRIC_PROFILE_URLS
-        ])
-    elif loader == "quilt" and loader_ver:
-        overlay = _json_from_urls([
-            QUILT_PROFILE_URL.format(mc=mc, loader=loader_ver)
-        ])
-    elif loader == "forge" and loader_ver:
-        vid = loader_ver if loader_ver.startswith(mc + "-") else f"{mc}-{loader_ver}"
-        overlay = _version_json_from_installer([
-            f"{FORGE_OFFICIAL_ROOT}/{vid}/forge-{vid}-installer.jar",
-            f"{FORGE_MIRROR_ROOT}/{vid}/forge-{vid}-installer.jar",
-        ])
-    elif loader == "neoforge" and loader_ver:
-        vid = loader_ver
-        overlay = _version_json_from_installer([
-            f"{NEOFORGE_MIRROR_ROOT}/{vid}/neoforge-{vid}-installer.jar",
-            f"{NEOFORGE_OFFICIAL_ROOT}/{vid}/neoforge-{vid}-installer.jar",
-        ])
-    else:
+    if not loader or not loader_ver:
         return base
+    overlay = fetch_loader_overlay(mc, loader, loader_ver)
     return _merge_version_json(base, overlay)
 
 
@@ -1173,11 +1231,30 @@ class MCDownloaderApp:
         self.download_thread = None
         self._search_after = None
 
+        # 多批次下载调度
+        self.download_queue = collections.deque()
+        self.download_lock = threading.Lock()
+        self.active_workers = 0
+        self._outstanding = 0
+        self._preparing = 0
+        self._target_workers = 4
+        self._active_vids = set()
+        self.downloading = False
+        self._modpack_remaining = 0
+        self._modpack_vids = set()
+
         self.stop_event = threading.Event()
         self._closing = False
         self._poll_job = None
 
         self.out_dir_var = tk.StringVar(value=default_download_dir())
+        self.mc_dir_var = tk.StringVar(value="")
+        self.installed_versions = []
+        self.installed_selected = None
+        self.installed_mc = ""
+        self._installed_loader = ""
+        self._loader_req = 0
+        self._installer_busy = False
         self.concurrency_var = tk.StringVar(value="4")
         # 每个模式记住自己的并发数：整合包默认 16 线程，其它模式默认 4
         self.concurrency_by_mode = {
@@ -1208,12 +1285,20 @@ class MCDownloaderApp:
         mode_frame = tb.Frame(header)
         mode_frame.pack(side=RIGHT)
         self.mode_var = tk.StringVar(value="client")
-        for text, val in [("客户端", "client"), ("服务端", "server"),
-                          ("加载器", "loader"), ("整合包", "modpack")]:
-            tb.Radiobutton(
-                mode_frame, text=text, variable=self.mode_var, value=val,
-                command=self.on_mode_change, bootstyle="info-toolbutton",
-            ).pack(side=LEFT, padx=(0, 2))
+        # 客户端 / 整合包 / 安装加载器 一组；服务端 / 下载加载器 一组
+        for group_index, group in enumerate((
+            (("客户端", "client"), ("整合包", "modpack"), ("安装加载器", "installer")),
+            (("服务端", "server"), ("加载器", "loader")),
+        )):
+            if group_index:
+                tk.Frame(
+                    mode_frame, width=1, bg=self._divider_color()
+                ).pack(side=LEFT, fill=Y, padx=8, pady=4)
+            for text, val in group:
+                tb.Radiobutton(
+                    mode_frame, text=text, variable=self.mode_var, value=val,
+                    command=self.on_mode_change, bootstyle="info-toolbutton",
+                ).pack(side=LEFT, padx=(0, 2))
 
         self.theme_btn = tb.Button(
             header, text="🌙 暗色", command=self.toggle_theme,
@@ -1229,9 +1314,9 @@ class MCDownloaderApp:
             bootstyle="danger-outline", width=10,
         ).pack(side=RIGHT)
 
-        search_card = tb.Frame(self.root, padding=(16, 4, 16, 4))
-        search_card.pack(fill=X)
-        self.search_frame = tb.Frame(search_card)
+        self.search_card = tb.Frame(self.root, padding=(16, 4, 16, 4))
+        self.search_card.pack(fill=X)
+        self.search_frame = tb.Frame(self.search_card)
         sf = self.search_frame
         sf.pack(fill=X)
         tb.Label(sf, text="搜索", font=FONT_BODY, bootstyle=SECONDARY).pack(
@@ -1279,7 +1364,7 @@ class MCDownloaderApp:
             ).pack(side=LEFT, padx=(0, 4))
 
         self.list_card = tb.Labelframe(
-            self.top_half, text=" 版本列表 / 加载器 / 整合包 ", padding=8, bootstyle="info"
+            self.top_half, text=" 主工作区 ", padding=8, bootstyle="info"
         )
         self.list_card.pack(fill=BOTH, expand=True, padx=16, pady=(4, 4))
 
@@ -1424,6 +1509,106 @@ class MCDownloaderApp:
         self.pack_tree.configure(yscrollcommand=pack_scroll.set)
         self.pack_tree.pack(side=LEFT, fill=BOTH, expand=True)
         pack_scroll.pack(side=RIGHT, fill=Y)
+
+        # 安装加载器
+        self.installer_frame = tb.Frame(self.list_body_container)
+
+        path_row = tb.Frame(self.installer_frame)
+        path_row.pack(fill=X)
+        tb.Label(path_row, text="游戏路径", font=FONT_BODY, bootstyle=SECONDARY).pack(
+            side=LEFT, padx=(0, 8)
+        )
+        self.mc_dir_entry = tb.Entry(
+            path_row, textvariable=self.mc_dir_var, font=FONT_MONO
+        )
+        self.mc_dir_entry.pack(side=LEFT, fill=X, expand=True)
+        self.mc_dir_entry.bind("<Return>", lambda e: self.scan_installed_versions())
+        tb.Button(
+            path_row, text="浏览", command=self.choose_mc_dir,
+            bootstyle="secondary-outline", width=6,
+        ).pack(side=LEFT, padx=(6, 0))
+        tb.Button(
+            path_row, text="刷新", command=self.scan_installed_versions,
+            bootstyle="info-outline", width=6,
+        ).pack(side=LEFT, padx=(4, 0))
+
+        self.installer_hint = tb.Label(
+            self.installer_frame,
+            text="请选择或输入 .minecraft 文件夹（其中应包含 versions 子目录）",
+            font=FONT_SMALL, bootstyle=SECONDARY, anchor=W,
+        )
+        self.installer_hint.pack(fill=X, pady=(4, 0))
+
+        self.installed_card = tb.Labelframe(
+            self.installer_frame, text=" 存有的游戏版本 ", padding=8, bootstyle="info"
+        )
+        self.installed_card.pack(fill=BOTH, expand=True, pady=(6, 4))
+        self.installed_tree = tb.Treeview(
+            self.installed_card, show="tree", selectmode="browse", height=6,
+        )
+        self.installed_tree.column("#0", width=400)
+        installed_scroll = tb.Scrollbar(
+            self.installed_card, orient=VERTICAL, command=self.installed_tree.yview
+        )
+        self.installed_tree.configure(yscrollcommand=installed_scroll.set)
+        self.installed_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        installed_scroll.pack(side=RIGHT, fill=Y)
+        self.installed_tree.bind("<<TreeviewSelect>>", self.on_installed_version_select)
+
+        self.installer_options = tb.Labelframe(
+            self.installer_frame, text=" 安装器选项 ", padding=8, bootstyle="secondary"
+        )
+        self.installer_options.pack(fill=X, pady=(4, 0))
+        self.installed_path_label = tb.Label(
+            self.installer_options, text="未选择游戏版本", font=FONT_SMALL,
+            bootstyle=SECONDARY, anchor=W, wraplength=900,
+        )
+        self.installed_path_label.pack(fill=X)
+        self.game_version_label = tb.Label(
+            self.installer_options, text="游戏版本：-", font=FONT_SMALL,
+            bootstyle=SECONDARY, anchor=W,
+        )
+        self.game_version_label.pack(fill=X, pady=(2, 6))
+
+        loader_row = tb.Frame(self.installer_options)
+        loader_row.pack(fill=X)
+        tb.Label(loader_row, text="加载器", font=FONT_BODY, bootstyle=SECONDARY).pack(
+            side=LEFT, padx=(0, 8)
+        )
+        self.installer_loader_var = tk.StringVar(value="")
+        self.installer_loader_combo = tb.Combobox(
+            loader_row, textvariable=self.installer_loader_var,
+            values=("Fabric", "Forge", "NeoForge"), state=DISABLED, width=16,
+        )
+        self.installer_loader_combo.pack(side=LEFT)
+        self.installer_loader_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self.on_installer_loader_change()
+        )
+
+        version_row = tb.Frame(self.installer_options)
+        version_row.pack(fill=X, pady=(6, 0))
+        tb.Label(version_row, text="加载器版本", font=FONT_BODY, bootstyle=SECONDARY).pack(
+            side=LEFT, padx=(0, 8)
+        )
+        self.installer_loader_version_var = tk.StringVar(value="")
+        self.installer_version_combo = tb.Combobox(
+            version_row, textvariable=self.installer_loader_version_var,
+            values=(), state=DISABLED, width=24,
+        )
+        self.installer_version_combo.pack(side=LEFT, fill=X, expand=True)
+        self.installer_version_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self.on_installer_version_change()
+        )
+
+        self.installer_btn = tb.Button(
+            self.installer_options, text="安装", command=self.install_selected_loader,
+            bootstyle=SUCCESS, state=DISABLED, width=10,
+        )
+        self.installer_btn.pack(anchor=E, pady=(8, 0))
+        self.installer_status = tb.Label(
+            self.installer_options, text="", font=FONT_SMALL, bootstyle=SECONDARY, anchor=W,
+        )
+        self.installer_status.pack(fill=X, pady=(4, 0))
 
         self.loader_sub_frame = tb.Frame(self.top_half, padding=(16, 4, 16, 4))
 
@@ -1684,6 +1869,10 @@ class MCDownloaderApp:
             self.concurrency_by_mode[self.mode] = self.concurrency_var.get()
         except Exception:
             pass
+        # 并发数改动实时生效：调大补线程，调小让多出来的线程跑完当前任务再退出
+        self._target_workers = self._active_concurrency()
+        if getattr(self, "downloading", False):
+            self._ensure_workers()
 
     def _apply_mode_concurrency(self):
         """切模式时换成该模式记住的并发数（整合包默认 16）。"""
@@ -1692,18 +1881,28 @@ class MCDownloaderApp:
             self.concurrency_var.set(self.concurrency_by_mode.get(self.mode, "4"))
         finally:
             self._concurrency_switching = False
+        self._target_workers = self._active_concurrency()
+        if getattr(self, "downloading", False):
+            self._ensure_workers()
 
     def on_mode_change(self):
         self.mode = self.mode_var.get()
         self._apply_mode_concurrency()
         # 整合包页内容多（工具条 + 拖放提示 + 文件清单 + 状态行），
         # 上半区多给一点高度，下半区相应压一点，提示才不会被裁掉。
-        if self.mode == "modpack":
+        if self.mode == "installer":
+            self.bottom_half.place_forget()
+            self.top_half.place_configure(relheight=1.0)
+            # 安装加载器页不需要搜索
+            self.search_card.pack_forget()
+        elif self.mode == "modpack":
+            self.search_card.pack(fill=X, before=self.middle_frame)
+            self.bottom_half.place(x=0, rely=0.58, relwidth=1, relheight=0.42)
             self.top_half.place_configure(relheight=0.58)
-            self.bottom_half.place_configure(rely=0.58, relheight=0.42)
         else:
+            self.search_card.pack(fill=X, before=self.middle_frame)
+            self.bottom_half.place(x=0, rely=0.5, relwidth=1, relheight=0.5)
             self.top_half.place_configure(relheight=0.5)
-            self.bottom_half.place_configure(rely=0.5, relheight=0.5)
         self.server_tabs_frame.pack_forget()
         self.loader_tabs_frame.pack_forget()
         self.loader_sub_frame.pack_forget()
@@ -1729,12 +1928,18 @@ class MCDownloaderApp:
         elif self.mode == "modpack":
             self.switch_view_modpack()
             self.render_modpack()
+        elif self.mode == "installer":
+            self.switch_view_installer()
+            if self.mc_dir_var.get().strip():
+                self.scan_installed_versions()
+            else:
+                self.show_installer_hint()
 
-        is_pack = self.mode == "modpack"
+        is_pack = self.mode in ("modpack", "installer")
         select_state = DISABLED if is_pack else NORMAL
         self.select_all_btn.config(state=select_state)
         self.select_none_btn.config(state=select_state)
-        self.download_btn.config(text="开始安装" if is_pack else "开始下载")
+        self.download_btn.config(text="开始安装" if self.mode == "modpack" else "开始下载")
         self.update_priority_btn()
         self.update_count()
 
@@ -1783,6 +1988,8 @@ class MCDownloaderApp:
     def switch_view(self, single=True):
         if hasattr(self, "modpack_frame"):
             self.modpack_frame.pack_forget()
+        if hasattr(self, "installer_frame"):
+            self.installer_frame.pack_forget()
         if single:
             self.forge_three_col_frame.pack_forget()
             self.single_list_frame.pack(fill=BOTH, expand=True)
@@ -1793,7 +2000,14 @@ class MCDownloaderApp:
     def switch_view_modpack(self):
         self.single_list_frame.pack_forget()
         self.forge_three_col_frame.pack_forget()
+        self.installer_frame.pack_forget()
         self.modpack_frame.pack(fill=BOTH, expand=True)
+
+    def switch_view_installer(self):
+        self.single_list_frame.pack_forget()
+        self.forge_three_col_frame.pack_forget()
+        self.modpack_frame.pack_forget()
+        self.installer_frame.pack(fill=BOTH, expand=True)
 
     def on_server_provider_change(self):
         pid = self.server_provider_var.get()
@@ -1908,7 +2122,7 @@ class MCDownloaderApp:
         self.load_modpack(path)
 
     def load_modpack(self, path):
-        if self.download_thread and self.download_thread.is_alive():
+        if self.downloading:
             self.set_pack_status("正在下载/安装中，请先停止再更换整合包", error=True)
             return
         if self.modpack_inspecting:
@@ -2062,8 +2276,11 @@ class MCDownloaderApp:
         tasks.extend(extras)
 
         self.set_pack_status(f"开始安装到：{target}")
+        self._modpack_remaining = len(tasks)
+        self._modpack_vids = {vid for _, vid, _ in tasks}
         if tasks:
-            self.begin_download(tasks, max_workers)
+            if not self.submit_tasks(tasks):
+                self._modpack_installing = False
         else:
             self.finish_modpack()
 
@@ -2250,6 +2467,297 @@ class MCDownloaderApp:
                 f"安装完成：已写入 {written} 个内置文件，目录 {target}{pending}"
             )
         self.update_count()
+
+    # ---------- 安装加载器 ----------
+
+    def show_installer_hint(self):
+        self.installer_hint.configure(
+            text="请选择或输入 .minecraft 文件夹（其中应包含 versions 子目录）"
+        )
+        self.installed_tree.delete(*self.installed_tree.get_children())
+        self._reset_installer_options()
+
+    def choose_mc_dir(self):
+        path = filedialog.askdirectory(
+            initialdir=self.mc_dir_var.get().strip() or os.getcwd(),
+            title="选择 .minecraft 文件夹",
+        )
+        if path:
+            self.mc_dir_var.set(path)
+            self.scan_installed_versions()
+
+    def _versions_dir(self):
+        base = self.mc_dir_var.get().strip()
+        if not base:
+            return ""
+        return os.path.join(base, "versions")
+
+    def scan_installed_versions(self):
+        self.installed_tree.delete(*self.installed_tree.get_children())
+        self.installed_versions = []
+        self._reset_installer_options()
+        versions_dir = self._versions_dir()
+        if not versions_dir or not os.path.isdir(versions_dir):
+            self.installer_hint.configure(
+                text="路径无效：请选择包含 versions 子目录的 .minecraft 文件夹"
+            )
+            return
+        for name in sorted(os.listdir(versions_dir), key=str.lower):
+            folder = os.path.join(versions_dir, name)
+            if not os.path.isdir(folder):
+                continue
+            jar = os.path.join(folder, name + ".jar")
+            js = os.path.join(folder, name + ".json")
+            if os.path.isfile(jar) and os.path.isfile(js):
+                self.installed_versions.append(name)
+                self.installed_tree.insert("", "end", text=name, values=(name,))
+        if self.installed_versions:
+            self.installer_hint.configure(
+                text=f"共找到 {len(self.installed_versions)} 个包含版本 JAR + JSON 的版本"
+            )
+        else:
+            self.installer_hint.configure(
+                text="versions 里没有同时包含 <名称>.jar 和 <名称>.json 的版本文件夹"
+            )
+
+    def _manifest_version_from_text(self, text):
+        """从任意字符串里找已安装清单中的版本号，例如 1.21.1-Forge_47.2.0。"""
+        if not isinstance(text, str) or not text:
+            return ""
+        for vid in sorted(self.versions, key=len, reverse=True):
+            start = 0
+            while True:
+                index = text.find(vid, start)
+                if index < 0:
+                    break
+                before = text[index - 1] if index > 0 else ""
+                after = text[index + len(vid)] if index + len(vid) < len(text) else ""
+                if (not before or not (before.isdigit() or before == ".")) and (
+                    not after or not (after.isdigit() or after == ".")
+                ):
+                    return vid
+                start = index + 1
+        return ""
+
+    def _mc_version_from_json(self, name, data, versions_dir, depth=0):
+        candidates = []
+        for key in ("clientVersion", "jar", "id", "inheritsFrom"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                candidates.append(value)
+        for value in candidates:
+            if value in self.versions:
+                return value
+        parent = data.get("inheritsFrom")
+        if isinstance(parent, str) and depth < 3:
+            parent_json = os.path.join(versions_dir, parent, parent + ".json")
+            if os.path.isfile(parent_json):
+                try:
+                    with open(parent_json, encoding="utf-8") as f:
+                        parent_data = json.load(f)
+                    found = self._mc_version_from_json(parent, parent_data, versions_dir, depth + 1)
+                    if found:
+                        return found
+                except Exception:
+                    pass
+            else:
+                found = self._manifest_version_from_text(parent)
+                if found:
+                    return found
+        for value in candidates:
+            found = self._manifest_version_from_text(value)
+            if found:
+                return found
+        for value in candidates:
+            if re.match(r"^\d+\.\d+(\.\d+)?$", value):
+                return value
+        return ""
+
+    @staticmethod
+    def _detect_installed_loader(data):
+        main = str(data.get("mainClass") or "").lower()
+        libs = " ".join(
+            str(lib.get("name") or "") for lib in (data.get("libraries") or [])
+        ).lower()
+        if "fabricmc" in main or "fabric-loader" in libs:
+            return "Fabric"
+        if "quiltmc" in main or "quilt-loader" in libs:
+            return "Quilt"
+        if "neoforge" in main or "neoforge" in libs:
+            return "NeoForge"
+        if "forge" in main or "minecraftforge" in libs:
+            return "Forge"
+        return ""
+
+    def _reset_installer_options(self):
+        self.installed_selected = None
+        self.installed_mc = ""
+        self._installed_loader = ""
+        self._loader_req += 1
+        self.installer_loader_var.set("")
+        self.installer_loader_version_var.set("")
+        self.installer_loader_combo.configure(state=DISABLED, values=("Fabric", "Forge", "NeoForge"))
+        self.installer_version_combo.configure(state=DISABLED, values=())
+        self.installer_btn.configure(state=DISABLED)
+        self.installed_path_label.configure(text="未选择游戏版本")
+        self.game_version_label.configure(text="游戏版本：-")
+        self.installer_status.configure(text="")
+
+    def on_installed_version_select(self, event=None):
+        selection = self.installed_tree.selection()
+        if not selection:
+            self._reset_installer_options()
+            return
+        name = self.installed_tree.item(selection[0], "text")
+        versions_dir = self._versions_dir()
+        folder = os.path.join(versions_dir, name)
+        json_path = os.path.join(folder, name + ".json")
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self._reset_installer_options()
+            self.installer_status.configure(text=f"读取版本 JSON 失败：{e}", bootstyle=DANGER)
+            return
+        mc = self._mc_version_from_json(name, data, versions_dir)
+        installed_loader = self._detect_installed_loader(data)
+        self.installed_selected = name
+        self.installed_mc = mc
+        self._installed_loader = installed_loader
+        self.installed_path_label.configure(text=f"版本路径：{folder}")
+        self.game_version_label.configure(text=f"游戏版本：{mc or '未知'}")
+        # 切换游戏版本：清空加载器 / 加载器版本选择
+        self._loader_req += 1
+        self.installer_loader_var.set("")
+        self.installer_loader_version_var.set("")
+        self.installer_version_combo.configure(state=DISABLED, values=())
+        self.installer_btn.configure(state=DISABLED)
+        if installed_loader:
+            self.installer_loader_combo.configure(state=DISABLED)
+            self.installer_status.configure(
+                text=f"该版本已安装 {installed_loader} 加载器，禁止重复安装",
+                bootstyle=DANGER,
+            )
+        elif mc:
+            self.installer_loader_combo.configure(state="readonly")
+            self.installer_status.configure(
+                text="请选择要安装的加载器", bootstyle=SECONDARY
+            )
+        else:
+            self.installer_loader_combo.configure(state=DISABLED)
+            self.installer_status.configure(
+                text="无法从版本 JSON 判断游戏版本，不能安装加载器", bootstyle=DANGER
+            )
+
+    def on_installer_loader_change(self):
+        if self._installed_loader:
+            return
+        self.installer_loader_version_var.set("")
+        self.installer_version_combo.configure(state=DISABLED, values=())
+        self.installer_btn.configure(state=DISABLED)
+        loader = self.installer_loader_var.get()
+        if not loader or not self.installed_mc:
+            return
+        self._loader_req += 1
+        request_id = self._loader_req
+        self.installer_status.configure(
+            text=f"正在获取 {loader} 适用于 {self.installed_mc} 的版本…", bootstyle=SECONDARY
+        )
+        threading.Thread(
+            target=self._fetch_loader_versions_worker,
+            args=(request_id, self.installed_mc, loader),
+            daemon=True,
+        ).start()
+
+    def _fetch_loader_versions_worker(self, request_id, mc, loader):
+        try:
+            versions = fetch_loader_versions(mc, loader)
+            self.queue.put(("loader_versions", request_id, versions, None))
+        except Exception as e:
+            self.queue.put(("loader_versions", request_id, [], str(e)))
+
+    def on_loader_versions(self, request_id, versions, error):
+        if request_id != self._loader_req:
+            return
+        if error:
+            self.installer_version_combo.configure(state=DISABLED, values=())
+            self.installer_status.configure(text=f"获取加载器版本失败：{error}", bootstyle=DANGER)
+            return
+        if not versions:
+            self.installer_version_combo.configure(state=DISABLED, values=())
+            self.installer_status.configure(text="没有可用版本", bootstyle=DANGER)
+            return
+        self.installer_version_combo.configure(
+            state="readonly", values=tuple(versions)
+        )
+        self.installer_status.configure(
+            text=f"共 {len(versions)} 个加载器版本，请选择", bootstyle=SECONDARY
+        )
+
+    def on_installer_version_change(self):
+        ready = bool(
+            self.installed_selected
+            and self.installer_loader_var.get()
+            and self.installer_loader_version_var.get()
+        )
+        self.installer_btn.configure(state=NORMAL if ready else DISABLED)
+
+    def install_selected_loader(self):
+        if self._installer_busy or self._installed_loader:
+            return
+        name = self.installed_selected
+        loader = self.installer_loader_var.get()
+        loader_version = self.installer_loader_version_var.get()
+        mc = self.installed_mc
+        if not (name and loader and loader_version and mc):
+            return
+        folder = os.path.join(self._versions_dir(), name)
+        self._installer_busy = True
+        self.installer_btn.configure(state=DISABLED)
+        self.installer_status.configure(text="正在安装加载器（不影响其他下载）…", bootstyle=SECONDARY)
+        threading.Thread(
+            target=self._install_loader_worker,
+            args=(name, folder, mc, loader, loader_version),
+            daemon=True,
+        ).start()
+
+    def _install_loader_worker(self, name, folder, mc, loader, loader_version):
+        json_path = os.path.join(folder, name + ".json")
+        try:
+            overlay = fetch_loader_overlay(mc, loader.lower(), loader_version)
+            with open(json_path, encoding="utf-8") as f:
+                base = json.load(f)
+            merged = _merge_version_json(base, overlay)
+            merged["id"] = name
+            backup = json_path + ".bak"
+            if not os.path.exists(backup):
+                shutil.copy2(json_path, backup)
+            tmp = json_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, json_path)
+            self.queue.put(("loader_install_done", name, loader, loader_version, None))
+        except Exception as e:
+            self.queue.put(("loader_install_done", name, loader, loader_version, str(e)))
+
+    def on_loader_install_done(self, name, loader, loader_version, error):
+        self._installer_busy = False
+        try:
+            self.installer_btn.configure(
+                state=NORMAL if self.installer_loader_version_var.get() else DISABLED
+            )
+        except Exception:
+            pass
+        if error:
+            self.installer_status.configure(text=f"安装失败：{error}", bootstyle=DANGER)
+            messagebox.showerror("安装失败", f"向版本 {name} 安装 {loader} 失败：\n{error}")
+        else:
+            self.installer_status.configure(
+                text=f"已把 {loader} {loader_version} 注入版本 {name}", bootstyle=SUCCESS
+            )
+            messagebox.showinfo(
+                "安装完成", f"已把 {loader} {loader_version} 注入版本：\n{name}"
+            )
 
     # ---------- 客户端清单加载 ----------
 
@@ -2748,6 +3256,8 @@ class MCDownloaderApp:
         elif self.mode == "modpack":
             n = len(self.modpack["files"]) if self.modpack else 0
             text = f"待下载：{n} 个文件"
+        elif self.mode == "installer":
+            text = "安装加载器"
         else:
             n = len(self.fabric_checked) + len(self.forge_checked) + len(self.neoforge_checked)
             text = f"已选：{n}"
@@ -2769,6 +3279,8 @@ class MCDownloaderApp:
             self.rebuild_server_list()
         elif self.mode == "modpack":
             self.render_modpack()
+        elif self.mode == "installer":
+            return
         else:
             if self.loader_mode == "fabric":
                 self.rebuild_loader_list()
@@ -2832,9 +3344,6 @@ class MCDownloaderApp:
     # ---------- 下载控制 ----------
 
     def start_download(self):
-        if self.download_thread and self.download_thread.is_alive():
-            messagebox.showinfo("提示", "当前已有下载任务进行中")
-            return
         out = self.out_dir_var.get().strip()
         if not out:
             messagebox.showerror("错误", "请先选择下载路径")
@@ -2843,15 +3352,12 @@ class MCDownloaderApp:
         except OSError as e:
             messagebox.showerror("错误", f"无法创建下载目录：\n{e}")
             return
-        try: max_workers = int(self.concurrency_var.get())
-        except ValueError: max_workers = 4
-        max_workers = max(1, min(32, max_workers))
 
         if self.mode == "modpack":
             if not self.modpack:
                 self.set_pack_status("还没有选择整合包", error=True)
                 return
-            self.start_modpack_install(max_workers)
+            self.start_modpack_install(self._active_concurrency())
             return
 
         if self.mode == "client":
@@ -2865,7 +3371,9 @@ class MCDownloaderApp:
             tasks = self.build_loader_tasks()
             if not tasks: return messagebox.showinfo("提示", "请先勾选要下载的加载器版本")
 
-        self.begin_download(tasks, max_workers)
+        if self.submit_tasks(tasks):
+            # 下载已交给后台调度，勾选立刻清空，释放界面以便继续选择下一批
+            self._clear_current_checked()
 
     def build_server_tasks(self):
         tasks = []
@@ -2897,24 +3405,64 @@ class MCDownloaderApp:
         return tasks
 
     def stop_download(self):
-        if not (self.download_thread and self.download_thread.is_alive()): return
+        if not self.downloading:
+            return
         self.stop_event.set()
         self.stop_btn.config(state=DISABLED, text="正在停止...")
+        with self.download_lock:
+            removed_tasks = list(self.download_queue)
+            self.download_queue.clear()
+            self._outstanding = max(0, self._outstanding - len(removed_tasks))
+            for task in removed_tasks:
+                self._active_vids.discard(task.get("vid"))
+        self._check_complete()
 
-    def begin_download(self, tasks, max_workers):
-        for w in self.progress_inner.winfo_children(): w.destroy()
-        self.task_widgets = {}
-        self.task_got = {}
-        for _, vid, _ in tasks:
-            self.task_got.setdefault(vid, 0)
-        self.total_size = 0
-        self.total_progress_var.set(0.0)
-        self.total_label.config(text="0%")
+    def _active_concurrency(self):
+        try:
+            value = int(self.concurrency_var.get())
+        except (TypeError, ValueError):
+            value = 4
+        return max(1, min(32, value))
+
+    def _clear_current_checked(self):
+        if self.mode == "client":
+            self.client_checked.clear()
+            self.rebuild_client_list()
+        elif self.mode == "server":
+            pid = self.server_provider_var.get()
+            self.server_checked.setdefault(pid, set()).clear()
+            self.rebuild_server_list()
+        elif self.mode == "loader":
+            if self.loader_mode == "fabric":
+                self.fabric_checked.clear()
+                self.rebuild_loader_list()
+            elif self.loader_mode == "forge":
+                self.forge_checked.clear()
+                self.rebuild_forge_views()
+            else:
+                self.neoforge_checked.clear()
+                self.rebuild_forge_views()
+        self.update_count()
+
+    def submit_tasks(self, tasks):
+        """把一批任务交给后台调度：立即返回，界面可继续选下一批。"""
+        pending = [task for task in tasks if task[1] not in self._active_vids]
+        if not pending:
+            messagebox.showinfo("提示", "这些版本已在下载队列中")
+            return False
+        if not self.downloading:
+            for widget in self.progress_inner.winfo_children():
+                widget.destroy()
+            self.task_widgets = {}
+            self.task_got = {}
+            self.total_size = 0
+            self.total_progress_var.set(0.0)
+            self.total_label.config(text="0%")
+            self.downloading = True
         self.stop_event.clear()
-        # Tk 变量只能在主线程读，先把下载目录取出来交给工作线程
         self._download_out_dir = self.out_dir_var.get().strip()
-
-        for kind, vid, info in tasks:
+        self._target_workers = self._active_concurrency()
+        for _kind, vid, _info in pending:
             frame = tb.Frame(self.progress_inner)
             frame.pack(fill=X, pady=3, padx=2)
             tb.Label(frame, text=vid, width=30, anchor=W, font=FONT_MONO).pack(side=LEFT)
@@ -2925,60 +3473,121 @@ class MCDownloaderApp:
             label = tb.Label(frame, text="等待解析", width=36, anchor=W, font=FONT_MONO, bootstyle=SECONDARY)
             label.pack(side=LEFT)
             self.task_widgets[vid] = {"pbar": pbar, "label": label, "src_label": src_label}
-
-        self.download_btn.config(state=DISABLED)
+            self.task_got.setdefault(vid, 0)
+            self._active_vids.add(vid)
+        with self.download_lock:
+            self._outstanding += len(pending)
+            self._preparing += 1
         self.stop_btn.config(state=NORMAL, text="停止下载")
-        self.concurrency_spin.config(state=DISABLED)
-        self.priority_btn.config(state=DISABLED)
-        self.download_thread = threading.Thread(
-            target=self.download_worker,
-            args=(tasks, max_workers, self.priority_source),
+        threading.Thread(
+            target=self._prepare_batch,
+            args=(pending, self.priority_source),
             daemon=True,
-        )
-        self.download_thread.start()
+        ).start()
+        self.update_total_progress()
+        return True
 
-    def download_worker(self, tasks, max_workers, priority_source):
+    def _prepare_one(self, kind, vid, info, priority_source, fallback_source):
+        if kind == "client":
+            return self.prepare_client(vid, priority_source, fallback_source)
+        if kind == "server_vanilla":
+            return self.prepare_vanilla_server(vid, priority_source, fallback_source)
+        if kind.startswith("server_"):
+            return self.prepare_third_server(kind[len("server_"):], vid, info)
+        if kind == "loader_fabric":
+            return self.prepare_fabric(vid, info)
+        if kind == "loader_forge":
+            return self.prepare_forge(vid)
+        if kind == "loader_neoforge":
+            return self.prepare_neoforge(vid)
+        if kind == "modpack":
+            return self.prepare_modpack_file(vid)
+        if kind == "modpack_extra":
+            return self.prepare_modpack_extra(vid, info)
+        return {"vid": vid, "error": f"未知类型 {kind}"}
+
+    def _prepare_batch(self, tasks, priority_source):
         fallback_source = "bmclapi" if priority_source == "mojang" else "mojang"
-        max_workers = max(1, min(max_workers, len(tasks)))
 
         def prepare(task):
             kind, vid, info = task
-            if self.stop_event.is_set(): return {"vid": vid, "cancelled": True}
+            if self.stop_event.is_set():
+                return {"vid": vid, "cancelled": True}
             try:
-                if kind == "client": return self.prepare_client(vid, priority_source, fallback_source)
-                elif kind == "server_vanilla": return self.prepare_vanilla_server(vid, priority_source, fallback_source)
-                elif kind.startswith("server_"): return self.prepare_third_server(kind[len("server_"):], vid, info)
-                elif kind == "loader_fabric": return self.prepare_fabric(vid, info)
-                elif kind == "loader_forge": return self.prepare_forge(vid)
-                elif kind == "loader_neoforge": return self.prepare_neoforge(vid)
-                elif kind == "modpack": return self.prepare_modpack_file(vid)
-                elif kind == "modpack_extra": return self.prepare_modpack_extra(vid, info)
-                return {"vid": vid, "error": f"未知类型 {kind}"}
-            except Exception as e: return {"vid": vid, "error": str(e)}
+                return self._prepare_one(kind, vid, info, priority_source, fallback_source)
+            except Exception as e:
+                return {"vid": vid, "error": str(e)}
 
-        parsed = []
-        skipped = []
-        with cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        workers = min(8, max(1, len(tasks)))
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
             for result in pool.map(prepare, tasks):
-                if result.get("cancelled"): continue
-                if result.get("skip"):
-                    skipped.append(result["vid"])
-                    self.queue.put(("task_source", result["vid"], "已存在"))
-                    self.queue.put(("task_done", result["vid"], True, "已存在"))
+                vid = result.get("vid")
+                if result.get("cancelled") or self.stop_event.is_set():
+                    self.queue.put(("task_cancelled", vid))
+                elif result.get("skip"):
+                    self.queue.put(("task_source", vid, "已存在"))
+                    self.queue.put(("task_done", vid, True, "已存在"))
                 elif "error" in result:
-                    self.queue.put(("task_done", result["vid"], False, result["error"]))
+                    self.queue.put(("task_done", vid, False, result["error"]))
                 else:
-                    parsed.append(result)
-                    self.queue.put(("task_source", result["vid"], result["candidates"][0]["source"]))
+                    with self.download_lock:
+                        self.download_queue.append(result)
+                    self.queue.put(("total_size_add", result["candidates"][0]["size"]))
+                    self.queue.put(("task_source", vid, result["candidates"][0]["source"]))
+        with self.download_lock:
+            self._preparing -= 1
+        self._ensure_workers()
+        self.queue.put(("worker_tick",))
 
-        total_size = sum(p["candidates"][0]["size"] for p in parsed)
-        self.queue.put(("total_size", total_size))
+    def _ensure_workers(self):
+        with self.download_lock:
+            if self.stop_event.is_set():
+                return
+            while self.active_workers < self._target_workers and self.download_queue:
+                self.active_workers += 1
+                threading.Thread(target=self._worker_loop, daemon=True).start()
 
-        if parsed and not self.stop_event.is_set():
-            with cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                list(pool.map(self.download_one_task, parsed))
+    def _worker_loop(self):
+        while True:
+            with self.download_lock:
+                if self.stop_event.is_set() or not self.download_queue:
+                    break
+                # 并发数调小后，多余线程跑完当前任务就退出
+                if self.active_workers > self._target_workers:
+                    break
+                task = self.download_queue.popleft()
+            self.download_one_task(task)
+        with self.download_lock:
+            self.active_workers -= 1
+        self.queue.put(("worker_tick",))
 
-        self.queue.put(("all_done", self.stop_event.is_set()))
+    def _check_complete(self):
+        if not self.downloading:
+            return
+        with self.download_lock:
+            active = self.active_workers
+            pending = len(self.download_queue)
+            preparing = self._preparing
+        if self._outstanding > 0 or preparing > 0 or active > 0 or pending > 0:
+            return
+        self.downloading = False
+        self.stop_btn.config(state=DISABLED, text="停止下载")
+        stopped = self.stop_event.is_set()
+        self._cleanup_part_files()
+        self.refresh_filetree()
+        if self.total_size:
+            done = sum(self.task_got.values())
+            self.total_progress_var.set(min(done * 100.0 / self.total_size, 100.0))
+        elif not stopped:
+            self.total_progress_var.set(100.0)
+        if stopped:
+            if self._modpack_installing:
+                self._modpack_installing = False
+                self.set_pack_status("已停止：已下载完成的文件保留，未完成的缓存已清理", error=True)
+            messagebox.showinfo("已停止", "下载已停止：\n已完整下载的文件已保留，未完成的缓存文件已清理。")
+        else:
+            messagebox.showinfo("完成", "所有下载任务已结束")
+        self.stop_event.clear()
 
     @staticmethod
     def _candidate(source, url, size=0, sha1=None, sha256=None, filename=None):
@@ -3052,13 +3661,14 @@ class MCDownloaderApp:
                     chosen_json = vj
             except Exception as e: last_err = f"{SOURCE_NAMES[src]}: {e}"
         if not candidates: return {"vid": vid, "error": last_err or "无可用源"}
+        version_dir = os.path.join(self._download_out_dir, vid)
         return {
             "vid": vid,
-            "path": os.path.join(self._download_out_dir, f"{vid}.jar"),
+            "path": os.path.join(version_dir, f"{vid}.jar"),
             "candidates": candidates,
-            # 下完原版 jar 顺手落一份版本 JSON，PCL/HMCL 能直接识别这个目录
+            # 每个版本单独一个文件夹：jar + 版本 JSON 放一起，PCL/HMCL 可直接识别
             "version_json": chosen_json,
-            "json_path": os.path.join(self._download_out_dir, f"{vid}.json"),
+            "json_path": os.path.join(version_dir, f"{vid}.json"),
         }
 
     def prepare_vanilla_server(self, vid, priority_source, fallback_source):
@@ -3272,10 +3882,11 @@ class MCDownloaderApp:
         out = self.out_dir_var.get().strip()
         if not out or not os.path.isdir(out): return
         try:
-            for name in os.listdir(out):
-                if name.endswith(".part"):
-                    try: os.remove(os.path.join(out, name))
-                    except OSError: pass
+            for root_dir, _dirs, files in os.walk(out):
+                for name in files:
+                    if name.endswith(".part"):
+                        try: os.remove(os.path.join(root_dir, name))
+                        except OSError: pass
         except OSError: pass
 
     # ---------- 消息循环 ----------
@@ -3327,8 +3938,10 @@ class MCDownloaderApp:
             w = self.task_widgets.get(msg[1])
             if w: w["label"].config(text=msg[2])
         elif kind == "task_cancelled":
-            w = self.task_widgets.get(msg[1])
+            vid = msg[1]
+            w = self.task_widgets.get(vid)
             if w: w["label"].config(text="已取消", bootstyle=WARNING)
+            self._mark_task_finished(vid)
         elif kind == "task_done":
             _, vid, success, text = msg
             if not success and self._modpack_installing:
@@ -3343,40 +3956,27 @@ class MCDownloaderApp:
                     label = "已存在" if text == "已存在" else "完成"
                     w["label"].config(text=label, bootstyle=SUCCESS)
                 else: w["label"].config(text=f"失败：{text[:36]}", bootstyle=DANGER)
-        elif kind == "total_size":
-            self.total_size = msg[1]
+            self._mark_task_finished(vid)
+        elif kind == "total_size_add":
+            self.total_size += msg[1]
             self.update_total_progress()
-        elif kind == "all_done":
-            stopped = msg[1] if len(msg) > 1 else False
-            self.download_btn.config(state=NORMAL)
-            self.stop_btn.config(state=DISABLED, text="停止下载")
-            self.concurrency_spin.config(state=NORMAL)
-            self.update_priority_btn()
-            if stopped:
-                self._cleanup_part_files()
-                self.refresh_filetree()
-                if self._modpack_installing:
-                    self._modpack_installing = False
-                    self.set_pack_status("已停止：已下载完成的文件保留，未完成的缓存已清理",
-                                         error=True)
-                messagebox.showinfo("已停止", "下载已停止：\n已完整下载的文件已保留，未完成的缓存文件已清理。")
-            else:
-                self.refresh_filetree()
-                if self.total_size:
-                    done = sum(self.task_got.values())
-                    self.total_progress_var.set(min(done * 100.0 / self.total_size, 100.0))
-                else: self.total_progress_var.set(100.0)
-                if self._modpack_installing:
-                    self.finish_modpack()
-                    if self.modpack_failures:
-                        messagebox.showwarning(
-                            "部分失败",
-                            f"有 {self.modpack_failures} 个文件下载失败，其余已写入整合包目录。",
-                        )
-                    else:
-                        messagebox.showinfo("完成", "整合包文件已全部下载，并写入内置配置。")
-                else:
-                    messagebox.showinfo("完成", "所有下载任务已结束")
+        elif kind == "worker_tick":
+            self._ensure_workers()
+            self._check_complete()
+        elif kind == "loader_versions":
+            self.on_loader_versions(msg[1], msg[2], msg[3])
+        elif kind == "loader_install_done":
+            self.on_loader_install_done(msg[1], msg[2], msg[3], msg[4])
+
+    def _mark_task_finished(self, vid):
+        if vid in self._active_vids:
+            self._active_vids.discard(vid)
+        self._outstanding = max(0, self._outstanding - 1)
+        if self._modpack_installing and vid in getattr(self, "_modpack_vids", set()):
+            self._modpack_remaining = max(0, self._modpack_remaining - 1)
+            if self._modpack_remaining == 0 and not self.modpack_finished:
+                self.finish_modpack()
+        self._check_complete()
 
     def update_total_progress(self):
         done = sum(self.task_got.values())
@@ -3394,7 +3994,7 @@ class MCDownloaderApp:
                 drop.close()
         except Exception:
             pass
-        if self.download_thread and self.download_thread.is_alive():
+        if self.downloading:
             if not messagebox.askyesno("确认", "仍有下载任务进行中，确定退出吗？"): return
             self.stop_event.set()
         for job in (getattr(self, "_poll_job", None), self._search_after,

@@ -1,6 +1,6 @@
 # Downloadminercaft
 
-一个用 Python + [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap) 写的 Minecraft 下载器，带图形界面，支持**客户端 / 服务端 / 加载器 / 整合包**四种模式。
+一个用 Python + [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap) 写的 Minecraft 下载器，带图形界面，支持**客户端 / 服务端 / 下载加载器 / 整合包 / 安装加载器**五个工作区。
 
 仓库地址：<https://github.com/DawnEcho1254/Downloadminercaft>
 
@@ -10,6 +10,7 @@
 - **服务端**：原版服务端，以及 Paper、Purpur、Leaves、Folia 的版本列表与构建下载。
 - **加载器**：Fabric、Forge、NeoForge 的版本浏览和安装器下载，自动处理官方源 / 镜像、Forge promos 与 NeoForge 版本号映射。
 - **整合包**：拖入或选择 `.mrpack` / 含 `mods`、`config` 的 `.zip`，自动校验格式并列出全部 Mod 与配置文件；按标准目录结构安装，只写入整合包实际覆盖的配置；生成自包含的版本 JSON（已合并加载器主类与依赖，不再是子版本）、按整合包名命名的原版 `jar` 和 `整合包信息.txt`。
+- **安装加载器**：选择 `.minecraft` 文件夹，扫描 `versions` 下同时含 JAR 与 JSON 的版本；读取版本 JSON 判断游戏版本，向选中版本直接注入 Fabric / Forge / NeoForge（合并为完整版本并自动备份原 JSON），已装加载器的版本会禁止重复安装。
 - 明暗主题切换、版本列表刷新、多线程下载、单文件进度与总进度、下载目录文件树。
 
 ## 运行
